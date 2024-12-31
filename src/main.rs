@@ -6,13 +6,16 @@ mod path;
 mod registry;
 mod utils;
 
+use std::fs::rename;
+
+use clap::Parser;
 use cli::{Cli, Commands, RegistryCommands};
 use colored::Colorize;
 use config::Config;
+use dialoguer::Select;
 use error::Result;
 use registry::RegistryManager;
-use clap::Parser;
-use dialoguer::Select;
+use tokio::fs::{set_permissions, File};
 
 struct Grip {
     config: Config,
@@ -36,16 +39,31 @@ impl Grip {
         })
     }
 
-    async fn install(&self, package_name: &str, version: Option<String>, asset: Option<String>) -> Result<()> {
+    async fn install(
+        &self,
+        package_name: &str,
+        version: Option<String>,
+        asset: Option<String>,
+    ) -> Result<()> {
         println!("{} Looking up package {}", "→".blue(), package_name.cyan());
 
         // Find package in registry
-        let package = self.registry_manager.find_package(&self.config.registries, package_name).await?;
-        
-        println!("{} Found package in repository: {}", "→".blue(), package.info.repository.cyan());
+        let package = self
+            .registry_manager
+            .find_package(&self.config.registries, package_name)
+            .await?;
+
+        println!(
+            "{} Found package in repository: {}",
+            "→".blue(),
+            package.info.repository.cyan()
+        );
 
         // Get releases from GitHub
-        let releases = self.registry_manager.get_releases(&package.info.repository).await?;
+        let releases = self
+            .registry_manager
+            .get_releases(&package.info.repository)
+            .await?;
 
         if releases.is_empty() {
             anyhow::bail!("No releases found for package '{}'", package_name);
@@ -85,10 +103,8 @@ impl Grip {
                 .find(|asset| asset["name"].as_str().unwrap_or("") == a)
                 .ok_or_else(|| anyhow::anyhow!("Asset {} not found", a))?,
             None => {
-                let asset_names: Vec<&str> = assets
-                    .iter()
-                    .filter_map(|a| a["name"].as_str())
-                    .collect();
+                let asset_names: Vec<&str> =
+                    assets.iter().filter_map(|a| a["name"].as_str()).collect();
 
                 println!("{} Available assets:", "→".blue());
                 let selection = Select::new()
@@ -104,29 +120,40 @@ impl Grip {
         let download_url = asset_obj["browser_download_url"]
             .as_str()
             .ok_or_else(|| anyhow::anyhow!("Invalid download URL"))?;
-        
+
         let filename = asset_obj["name"]
             .as_str()
             .ok_or_else(|| anyhow::anyhow!("Invalid asset name"))?;
 
         // Download and install
-        let target_dir = self.registry_manager.data_dir
+        let target_dir = self
+            .registry_manager
+            .data_dir
             .join("packages")
             .join(package_name)
             .join(release["tag_name"].as_str().unwrap_or("unknown"));
 
-        let downloaded_file = self.registry_manager
+        let mut downloaded_file = self
+            .registry_manager
             .download_asset(download_url, filename, &target_dir)
             .await?;
 
         // Handle archive extraction if needed
-        if filename.ends_with(".zip") || filename.ends_with(".tar.gz") || filename.ends_with(".tgz") {
+        if filename.ends_with(".zip") || filename.ends_with(".tar.gz") || filename.ends_with(".tgz")
+        {
             println!("{} Extracting archive...", "→".blue());
             utils::extract_archive(&downloaded_file, &target_dir);
             println!("{} Extracted to {:?}", "✓".green(), target_dir);
-            
+
             // Clean up archive after extraction
             std::fs::remove_file(downloaded_file)?;
+        } else {
+            if let Some(executable_name) = package.info.executable_name {
+                let mut new_pathbuf = downloaded_file.clone();
+                new_pathbuf.set_file_name(executable_name);
+                new_pathbuf.set_extension(downloaded_file.extension().unwrap());
+                rename(downloaded_file, new_pathbuf)?;
+            }
         }
 
         // Add to PATH if needed
@@ -138,7 +165,11 @@ impl Grip {
 
     async fn handle_registry_command(&mut self, cmd: RegistryCommands) -> Result<()> {
         match cmd {
-            RegistryCommands::Add { name, url, priority } => {
+            RegistryCommands::Add {
+                name,
+                url,
+                priority,
+            } => {
                 if self.config.registries.iter().any(|r| r.name == name) {
                     anyhow::bail!("Registry '{}' already exists", name);
                 }
@@ -167,7 +198,9 @@ impl Grip {
                 self.config.save()?;
 
                 // Remove cached registry
-                let registry_path = self.registry_manager.data_dir
+                let registry_path = self
+                    .registry_manager
+                    .data_dir
                     .join("registries")
                     .join(&name);
                 if registry_path.exists() {
@@ -179,7 +212,8 @@ impl Grip {
             RegistryCommands::List => {
                 println!("{} Configured registries:", "→".blue());
                 for registry in &self.config.registries {
-                    println!("  {} {} (priority: {}, url: {})",
+                    println!(
+                        "  {} {} (priority: {}, url: {})",
                         "→".blue(),
                         registry.name.cyan(),
                         registry.priority,
@@ -198,10 +232,7 @@ impl Grip {
             "dependencies": {}
         });
 
-        std::fs::write(
-            "grip.json",
-            serde_json::to_string_pretty(&config)?,
-        )?;
+        std::fs::write("grip.json", serde_json::to_string_pretty(&config)?)?;
 
         println!("{} Created grip.json", "✓".green());
         Ok(())
@@ -214,7 +245,11 @@ async fn main() -> Result<()> {
     let mut grip = Grip::new().await?;
 
     match cli.command {
-        Commands::Install { package, version, asset } => {
+        Commands::Install {
+            package,
+            version,
+            asset,
+        } => {
             grip.install(&package, version, asset).await?;
         }
         Commands::Registry { cmd } => {
